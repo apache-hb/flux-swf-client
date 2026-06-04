@@ -87,6 +87,7 @@ public final class ActivityExecutionUtil {
     public static StepResult executeHooksAndActivity(Workflow workflow, WorkflowStep step, StepInputAccessor stepInput,
                                                      MetricRecorder fluxMetrics, MetricRecorder stepMetrics) {
         String activityName = TaskNaming.activityName(workflow, step);
+        ExecutionAttributes attributes = new ExecutionAttributes(stepInput);
         try {
             List<WorkflowStepHook> hooks = workflow.getGraph().getHooksForStep(step.getClass());
 
@@ -95,12 +96,12 @@ public final class ActivityExecutionUtil {
 
             StepResult result = null;
             if (hooks != null && step.getClass() != PostWorkflowHookAnchor.class) {
-                result = WorkflowStepUtil.executeHooks(hooks, stepInput, hookInput, StepHook.HookType.PRE, activityName,
+                result = WorkflowStepUtil.executeHooks(hooks, attributes, hookInput, StepHook.HookType.PRE, activityName,
                         fluxMetrics, stepMetrics, workflow, step);
             }
 
             if (result == null) {
-                result = executeActivity(step, activityName, fluxMetrics, stepMetrics, stepInput, workflow);
+                result = executeActivity(step, activityName, fluxMetrics, stepMetrics, attributes, workflow);
 
                 hookInput.putAll(result.getAttributes());
 
@@ -111,17 +112,26 @@ public final class ActivityExecutionUtil {
                 if (result.getResultCode() != null) {
                     hookInput.put(StepAttributes.RESULT_CODE, result.getResultCode());
                 }
+            }
 
-                if (hooks != null && step.getClass() != PreWorkflowHookAnchor.class) {
-                    StepResult hookResult = WorkflowStepUtil.executeHooks(hooks, stepInput, hookInput, StepHook.HookType.POST,
-                            activityName, fluxMetrics, stepMetrics, workflow, step);
-                    if (hookResult != null) {
-                        log.info("Activity {} returned result {} ({}) but a post-step hook requires a retry ({}).",
-                                activityName, result.getResultCode(), result.getMessage(),
-                                hookResult.getMessage());
-                        return hookResult;
-                    }
+            if (hooks != null && step.getClass() != PreWorkflowHookAnchor.class) {
+                StepResult hookResult = WorkflowStepUtil.executeHooks(hooks, attributes, hookInput, StepHook.HookType.POST,
+                        activityName, fluxMetrics, stepMetrics, workflow, step);
+                if (hookResult != null) {
+                    log.info("Activity {} returned result {} ({}) but a post-step hook requires a retry ({}).",
+                            activityName, result.getResultCode(), result.getMessage(),
+                            hookResult.getMessage());
+                    return hookResult;
                 }
+            }
+
+            if (result.getAction() != StepResult.ResultAction.RETRY) {
+                //
+                // Only attach the extra attributes the step hooks added
+                // if the result was not a retry. Preserving attributes
+                // across retries could cause hooks to not be idempotent.
+                //
+                result.withAttributes(attributes.extraAttributes());
             }
 
             return result;
