@@ -93,33 +93,55 @@ public final class ActivityExecutionUtil {
             Map<String, Object> hookInput = new HashMap<>();
             hookInput.put(StepAttributes.ACTIVITY_NAME, StepAttributes.encode(activityName));
 
+            // Hooks on the workflow hook anchor steps run for their side effects only;
+            // they cannot override the anchor's result, so we discard any HookResult they return.
+            boolean isWorkflowHookAnchor = (step.getClass() == PreWorkflowHookAnchor.class
+                                            || step.getClass() == PostWorkflowHookAnchor.class);
+
             StepResult result = null;
             if (hooks != null && step.getClass() != PostWorkflowHookAnchor.class) {
                 result = WorkflowStepUtil.executeHooks(hooks, stepInput, hookInput, StepHook.HookType.PRE, activityName,
                         fluxMetrics, stepMetrics, workflow, step);
+                if (isWorkflowHookAnchor && result != null) {
+                    log.warn("Cannot override the result of a workflow hook {} ({})",
+                             result.getAction(), result.getMessage());
+                    result = null;
+                }
             }
+
+            // Did the pre-step hooks override the result of the step
+            boolean preHookOverride = result != null;
 
             if (result == null) {
                 result = executeActivity(step, activityName, fluxMetrics, stepMetrics, stepInput, workflow);
 
                 hookInput.putAll(result.getAttributes());
+            }
 
-                // retries put their reason message in the special ActivityTaskFailed reason field.
-                if (result.getAction() != StepResult.ResultAction.RETRY && result.getMessage() != null) {
-                    hookInput.put(StepAttributes.ACTIVITY_COMPLETION_MESSAGE, result.getMessage());
-                }
-                if (result.getResultCode() != null) {
-                    hookInput.put(StepAttributes.RESULT_CODE, result.getResultCode());
-                }
+            // retries put their reason message in the special ActivityTaskFailed reason field.
+            if (result.getAction() != StepResult.ResultAction.RETRY && result.getMessage() != null) {
+                hookInput.put(StepAttributes.ACTIVITY_COMPLETION_MESSAGE, result.getMessage());
+            }
+            if (result.getResultCode() != null) {
+                hookInput.put(StepAttributes.RESULT_CODE, result.getResultCode());
+            }
 
-                if (hooks != null && step.getClass() != PreWorkflowHookAnchor.class) {
-                    StepResult hookResult = WorkflowStepUtil.executeHooks(hooks, stepInput, hookInput, StepHook.HookType.POST,
-                            activityName, fluxMetrics, stepMetrics, workflow, step);
-                    if (hookResult != null) {
-                        log.info("Activity {} returned result {} ({}) but a post-step hook requires a retry ({}).",
-                                activityName, result.getResultCode(), result.getMessage(),
+            if (hooks != null && step.getClass() != PreWorkflowHookAnchor.class) {
+                StepResult hookResult = WorkflowStepUtil.executeHooks(hooks, stepInput, hookInput, StepHook.HookType.POST,
+                        activityName, fluxMetrics, stepMetrics, workflow, step);
+
+                if (hookResult != null) {
+                    if (isWorkflowHookAnchor) {
+                        log.warn("Cannot override the result of a workflow hook {} ({})",
+                                 hookResult.getAction(), hookResult.getMessage());
+                    } else {
+                        log.info("Activity {} returned result {} ({}) but a post-step hook replaced the result with {} ({}).",
+                                activityName, result.getResultCode(), result.getMessage(), hookResult.getAction(),
                                 hookResult.getMessage());
-                        return hookResult;
+
+                        if (!preHookOverride) {
+                            result = hookResult;
+                        }
                     }
                 }
             }

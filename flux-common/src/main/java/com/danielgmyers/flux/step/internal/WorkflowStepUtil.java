@@ -29,6 +29,7 @@ import java.util.stream.Collectors;
 import com.danielgmyers.flux.ex.AttributeTypeMismatchException;
 import com.danielgmyers.flux.poller.TaskNaming;
 import com.danielgmyers.flux.step.Attribute;
+import com.danielgmyers.flux.step.HookResult;
 import com.danielgmyers.flux.step.PartitionIdGenerator;
 import com.danielgmyers.flux.step.PartitionIdGeneratorResult;
 import com.danielgmyers.flux.step.PartitionedWorkflowStep;
@@ -185,12 +186,15 @@ public final class WorkflowStepUtil {
                                           Map<String, Object> specialHookInputs, StepHook.HookType hookType,
                                           String activityName, MetricRecorder fluxMetrics, MetricRecorder hookMetrics,
                                           Workflow workflow, WorkflowStep step) {
+
+        StepResult finalResult = null;
         for (WorkflowStepHook hook : hooks) {
             Map<Method, StepHook> methods = WorkflowStepUtil.getAllMethodsWithAnnotation(hook.getClass(), StepHook.class);
             for (Map.Entry<Method, StepHook> method : methods.entrySet()) {
                 if (method.getValue().hookType() != hookType) {
                     continue;
                 }
+
                 String hookExecutionTimeMetricName = formatHookExecutionTimeName(hook.getClass().getSimpleName(),
                                                         method.getKey().getName(), activityName);
                 fluxMetrics.startDuration(hookExecutionTimeMetricName);
@@ -205,6 +209,15 @@ public final class WorkflowStepUtil {
                     if (result != null) {
                         log.info("Hook {} for activity {} returned value: {}",
                                                hook.getClass().getSimpleName(), activityName, result);
+
+                        if (result instanceof HookResult && finalResult == null) {
+                            HookResult hookResult = (HookResult) result;
+                            if (hookResult.isForceResult()) {
+                                finalResult = StepResult.complete(hookResult.getResultCode(), hookResult.getMessage());
+                            } else if (hookResult.isRetry()) {
+                                finalResult = StepResult.retry(hookResult.getMessage());
+                            }
+                        }
                     }
                 } catch (InvocationTargetException e) {
                     String message = String.format("Hook %s for activity %s threw an exception (%s)",
@@ -212,7 +225,9 @@ public final class WorkflowStepUtil {
                     if (method.getValue().retryOnFailure()) {
                         message += ", and the hook is configured to retry on failure.";
                         log.info(message, e.getCause());
-                        return StepResult.retry(message);
+                        if (finalResult == null) {
+                            finalResult = StepResult.retry(message);
+                        }
                     } else {
                         log.info("{}, but the hook is configured to ignore failures.", message, e.getCause());
                     }
@@ -224,7 +239,9 @@ public final class WorkflowStepUtil {
                     if (method.getValue().retryOnFailure()) {
                         message += ", and the hook is configured to retry on failure.";
                         log.error(message, e.getCause());
-                        return StepResult.retry(message);
+                        if (finalResult == null) {
+                            finalResult = StepResult.retry(message);
+                        }
                     } else {
                         log.error("{}, but the hook is configured to ignore failures.", message, e.getCause());
                     }
@@ -233,7 +250,8 @@ public final class WorkflowStepUtil {
                 }
             }
         }
-        return null;
+
+        return finalResult;
     }
 
     // public only for testing visibility
