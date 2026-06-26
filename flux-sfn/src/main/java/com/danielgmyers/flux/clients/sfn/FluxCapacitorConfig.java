@@ -29,8 +29,11 @@ public class FluxCapacitorConfig {
 
     private String awsRegion;
     private String awsAccountId;
+    private String stateMachineRoleArn;
+    private boolean registerWorkflowsOnStartup = true;
+    private boolean updateExistingStateMachines = true;
     private Double exponentialBackoffBase;
-    private Function<String, String> hostnameTransformerForPollerIdentity = (hostname) -> hostname;
+    private Function<String, String> hostnameTransformerForPollerIdentity = Function.identity();
     private String sfnEndpoint;
     private ClientOverrideConfiguration clientOverrideConfiguration;
     private final Map<String, TaskListConfig> taskListConfigs = new HashMap<>();
@@ -68,6 +71,70 @@ public class FluxCapacitorConfig {
             throw new IllegalArgumentException("awsAccountId may not be null.");
         }
         this.awsAccountId = awsAccountId;
+    }
+
+    public String getStateMachineRoleArn() {
+        return stateMachineRoleArn;
+    }
+
+    /**
+     * Configures the IAM role ARN that Step Functions will assume when running registered workflows.
+     * This role must be able to invoke the activities registered by Flux.
+     *
+     * This value is required if Flux is going to register workflows on startup. If you only plan to
+     * use Flux to start executions of workflows registered out-of-band, you may leave this unset.
+     */
+    public void setStateMachineRoleArn(String stateMachineRoleArn) {
+        if (stateMachineRoleArn == null) {
+            throw new IllegalArgumentException("stateMachineRoleArn may not be null.");
+        }
+        this.stateMachineRoleArn = stateMachineRoleArn;
+    }
+
+    public boolean isRegisterWorkflowsOnStartup() {
+        return registerWorkflowsOnStartup;
+    }
+
+    /**
+     * Controls whether Flux registers Step Functions activities and state machines on startup.
+     *
+     * <p>Defaults to {@code true}, which matches Flux's traditional behavior: the runtime owns the state
+     * machine and activity definitions.</p>
+     *
+     * <p>Set to {@code false} when the state machines (and activities) are managed externally — for
+     * example, deployed via CDK using the ASL JSON produced by {@link com.danielgmyers.flux.clients.sfn.asl.AslGenerator}
+     * at build time. In that mode {@code FluxCapacitor.initialize()} sets up the worker pollers and
+     * periodic-workflow scheduler but makes no Step Functions {@code CreateActivity},
+     * {@code CreateStateMachine}, or {@code UpdateStateMachine} calls.</p>
+     *
+     * <p>When this is {@code false}, {@link #setStateMachineRoleArn(String)} is not required.</p>
+     */
+    public void setRegisterWorkflowsOnStartup(boolean registerWorkflowsOnStartup) {
+        this.registerWorkflowsOnStartup = registerWorkflowsOnStartup;
+    }
+
+    public boolean isUpdateExistingStateMachines() {
+        return updateExistingStateMachines;
+    }
+
+    /**
+     * Controls whether Flux issues {@code UpdateStateMachine} when an existing state machine's
+     * definition does not match the Flux-generated ASL.
+     *
+     * <p>Defaults to {@code true}: if the existing definition differs, Flux replaces it with a new
+     * published version. This is the historic behaviour and is appropriate when Flux owns the state
+     * machine.</p>
+     *
+     * <p>Set to {@code false} when state machines are deployed by an external system (e.g. CDK or
+     * a CI/CD pipeline running {@code AslExporter} during build) and Flux should treat the deployed
+     * definition as authoritative. With this disabled and a mismatched definition present, Flux
+     * still creates the state machine if it is missing, but it will only log a warning when the
+     * existing definition differs, leaving the deployed state machine untouched.</p>
+     *
+     * <p>Has no effect when {@link #setRegisterWorkflowsOnStartup(boolean)} is {@code false}.</p>
+     */
+    public void setUpdateExistingStateMachines(boolean updateExistingStateMachines) {
+        this.updateExistingStateMachines = updateExistingStateMachines;
     }
 
     public Double getExponentialBackoffBase() {

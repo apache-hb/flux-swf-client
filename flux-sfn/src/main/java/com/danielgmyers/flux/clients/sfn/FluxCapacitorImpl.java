@@ -16,6 +16,8 @@
 
 package com.danielgmyers.flux.clients.sfn;
 
+import java.io.IOException;
+import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.URI;
 import java.net.UnknownHostException;
@@ -23,6 +25,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -36,22 +39,30 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
-import com.danielgmyers.flux.FluxCapacitor;
 import com.danielgmyers.flux.RemoteWorkflowExecutor;
 import com.danielgmyers.flux.WorkflowStatusChecker;
+import com.danielgmyers.flux.clients.sfn.asl.AslGenerator;
+import com.danielgmyers.flux.clients.sfn.asl.AslStateMachine;
 import com.danielgmyers.flux.clients.sfn.poller.ActivityTaskPoller;
+import com.danielgmyers.flux.clients.sfn.step.SfnStepInputAccessor;
 import com.danielgmyers.flux.clients.sfn.util.SfnArnFormatter;
 import com.danielgmyers.flux.ex.FluxException;
+import com.danielgmyers.flux.ex.WorkflowExecutionException;
 import com.danielgmyers.flux.poller.TaskNaming;
+import com.danielgmyers.flux.step.PartitionedWorkflowStep;
 import com.danielgmyers.flux.step.StepAttributes;
 import com.danielgmyers.flux.step.WorkflowStep;
 import com.danielgmyers.flux.threads.BlockOnSubmissionThreadPoolExecutor;
 import com.danielgmyers.flux.threads.ThreadUtils;
 import com.danielgmyers.flux.util.AwsRetryUtils;
+import com.danielgmyers.flux.wf.Periodic;
 import com.danielgmyers.flux.wf.Workflow;
 import com.danielgmyers.flux.wf.graph.WorkflowGraphNode;
 import com.danielgmyers.metrics.MetricRecorder;
 import com.danielgmyers.metrics.MetricRecorderFactory;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -66,18 +77,33 @@ import software.amazon.awssdk.services.sfn.SfnClient;
 import software.amazon.awssdk.services.sfn.SfnClientBuilder;
 import software.amazon.awssdk.services.sfn.model.ActivityListItem;
 import software.amazon.awssdk.services.sfn.model.CreateActivityRequest;
+import software.amazon.awssdk.services.sfn.model.CreateStateMachineRequest;
+import software.amazon.awssdk.services.sfn.model.CreateStateMachineResponse;
+import software.amazon.awssdk.services.sfn.model.DescribeStateMachineRequest;
+import software.amazon.awssdk.services.sfn.model.DescribeStateMachineResponse;
+import software.amazon.awssdk.services.sfn.model.ExecutionAlreadyExistsException;
 import software.amazon.awssdk.services.sfn.model.ListActivitiesRequest;
 import software.amazon.awssdk.services.sfn.model.StartExecutionRequest;
+import software.amazon.awssdk.services.sfn.model.StartExecutionResponse;
+import software.amazon.awssdk.services.sfn.model.StateMachineDoesNotExistException;
+import software.amazon.awssdk.services.sfn.model.StateMachineType;
+import software.amazon.awssdk.services.sfn.model.UpdateStateMachineRequest;
 
 /**
  * The primary class through which the Flux library is used at runtime.
  */
-public class FluxCapacitorImpl implements FluxCapacitor {
+public class FluxCapacitorImpl implements SfnFluxCapacitor {
 
     private static final Logger log = LoggerFactory.getLogger(FluxCapacitorImpl.class);
 
     private static final String LIST_ACTIVITIES_METRIC_PREFIX = "Flux.ListActivities";
     private static final String CREATE_ACTIVITY_METRIC_PREFIX = "Flux.CreateActivity";
+    private static final String DESCRIBE_STATE_MACHINE_METRIC_PREFIX = "Flux.DescribeStateMachine";
+    private static final String CREATE_STATE_MACHINE_METRIC_PREFIX = "Flux.CreateStateMachine";
+    private static final String UPDATE_STATE_MACHINE_METRIC_PREFIX = "Flux.UpdateStateMachine";
+    private static final String START_EXECUTION_METRIC_PREFIX = "Flux.StartExecution";
+
+    private static final ObjectMapper JSON_MAPPER = new ObjectMapper();
 
     private final SfnClient sfn;
     private final FluxCapacitorConfig config;
@@ -138,7 +164,7 @@ public class FluxCapacitorImpl implements FluxCapacitor {
      * @param credentials    - A provider for the AWS credentials that should be used to call AWS APIs
      * @param config         - Configuration data for FluxCapacitor to use to configure itself
      */
-    static FluxCapacitor create(MetricRecorderFactory metricsFactory, AwsCredentialsProvider credentials,
+    static SfnFluxCapacitor create(MetricRecorderFactory metricsFactory, AwsCredentialsProvider credentials,
                                 FluxCapacitorConfig config) {
         // We do our own retry/backoff logic so we can get decent metrics, so here we disable the SDK's defaults.
         RetryPolicy retryPolicy = RetryPolicy.builder()
@@ -182,8 +208,14 @@ public class FluxCapacitorImpl implements FluxCapacitor {
         }
 
         populateMaps(workflows);
-        registerActivities();
-        registerWorkflows();
+        if (config.isRegisterWorkflowsOnStartup()) {
+            registerActivities();
+            registerWorkflows();
+        } else {
+            log.info("registerWorkflowsOnStartup is false; skipping CreateActivity / CreateStateMachine. "
+                     + "The workflows' state machines and activities are expected to be managed externally "
+                     + "(e.g. via CDK using AslGenerator output).");
+        }
         initializePollers();
         startPeriodicWorkflows();
     }
@@ -191,13 +223,72 @@ public class FluxCapacitorImpl implements FluxCapacitor {
     @Override
     public WorkflowStatusChecker executeWorkflow(Class<? extends Workflow> workflowType, String workflowId,
                                                  Map<String, Object> workflowInput) {
-        return null;
+        return executeWorkflow(workflowType, workflowId, workflowInput, Collections.emptySet());
     }
 
     @Override
     public WorkflowStatusChecker executeWorkflow(Class<? extends Workflow> workflowType, String workflowId,
                                                  Map<String, Object> workflowInput, Set<String> executionTags) {
-        return null;
+        if (workflowsByClass.isEmpty()) {
+            throw new WorkflowExecutionException("Flux has not yet been initialized; "
+                                                 + "executeWorkflow() may only be called after initialize().");
+        }
+        if (!workflowsByClass.containsKey(workflowType)) {
+            throw new WorkflowExecutionException("Cannot execute a workflow that was not provided to Flux at "
+                                                 + "initialization: " + workflowType.getSimpleName());
+        }
+        if (executionTags != null && !executionTags.isEmpty()) {
+            log.warn("Step Functions does not support workflow execution tags. Ignoring the provided tags: {} "
+                     + "for workflow {}", executionTags, workflowId);
+        }
+        IdentifierValidation.validateWorkflowExecutionId(workflowId);
+
+        Workflow workflow = workflowsByClass.get(workflowType);
+
+        StartExecutionRequest request;
+        try {
+            request = buildStartWorkflowRequest(workflow, config.getAwsRegion(), config.getAwsAccountId(),
+                                                workflowId, workflowInput, clock);
+        } catch (JsonProcessingException e) {
+            throw new WorkflowExecutionException("Unable to serialize workflow input as JSON.", e);
+        }
+
+        try (MetricRecorder metrics = metricsFactory.newMetricRecorder(START_EXECUTION_METRIC_PREFIX)) {
+            try {
+                StartExecutionResponse response = AwsRetryUtils.executeWithInlineBackoff(
+                        () -> sfn.startExecution(request),
+                        REGISTRATION_MAX_RETRY_ATTEMPTS,
+                        REGISTRATION_MIN_RETRY_DELAY, REGISTRATION_MAX_RETRY_DELAY,
+                        metrics, START_EXECUTION_METRIC_PREFIX);
+                log.debug("Started workflow {} with id {}: execution arn={}",
+                          workflowType.getSimpleName(), workflowId, response.executionArn());
+                return new WorkflowStatusCheckerImpl(clock, sfn, response.executionArn());
+            } catch (ExecutionAlreadyExistsException e) {
+                // SFN execution names are unique within a 90-day window. Flux's contract is that callers can
+                // safely retry executeWorkflow with the same workflowId and get back a status checker for the
+                // existing execution; we honor that here by reconstructing the execution ARN.
+                String executionArn = SfnArnFormatter.executionArn(config.getAwsRegion(),
+                                                                    config.getAwsAccountId(),
+                                                                    workflowType, workflowId);
+                log.debug("Workflow {} with id {} is already running; returning a checker for arn {}",
+                          workflowType.getSimpleName(), workflowId, executionArn);
+                return new WorkflowStatusCheckerImpl(clock, sfn, executionArn);
+            } catch (RuntimeException e) {
+                throw new WorkflowExecutionException(
+                        "Failed to start workflow " + workflowType.getSimpleName() + " with id " + workflowId, e);
+            }
+        }
+    }
+
+    @Override
+    public void writeAslDefinition(Workflow workflow, String awsRegion, String awsAccountId,
+                                   OutputStream out) throws IOException {
+        AslExporter.writeAslDefinition(workflow, awsRegion, awsAccountId, out);
+    }
+
+    @Override
+    public List<String> listExpectedActivityNames(Workflow workflow) {
+        return AslExporter.listExpectedActivityNames(workflow);
     }
 
     @Override
@@ -278,9 +369,17 @@ public class FluxCapacitorImpl implements FluxCapacitor {
 
     // Package-private for RemoteWorkflowExecutorImpl and unit test access
     static StartExecutionRequest buildStartWorkflowRequest(Workflow workflow, String awsRegion, String awsAccountId,
-                                                           String executionId, Map<String, Object> input) {
+                                                           String executionId, Map<String, Object> input,
+                                                           Clock clock)
+            throws JsonProcessingException {
+
+        SfnStepInputAccessor accessor = new SfnStepInputAccessor(null);
+        if (input != null) {
+            accessor.addAttributes(input);
+        }
+
         return StartExecutionRequest.builder()
-                .input(StepAttributes.encode(StepAttributes.serializeMapValues(input)))
+                .input(accessor.toJson())
                 .name(executionId)
                 .stateMachineArn(SfnArnFormatter.workflowArn(awsRegion, awsAccountId, workflow.getClass()))
                 .build();
@@ -304,22 +403,29 @@ public class FluxCapacitorImpl implements FluxCapacitor {
             for (Map.Entry<Class<? extends WorkflowStep>, WorkflowGraphNode> entry : workflow.getGraph().getNodes().entrySet()) {
                 IdentifierValidation.validateStepName(entry.getKey());
 
-                String activityName = buildSfnActivityName(workflow.getClass(), entry.getValue().getStep().getClass());
+                WorkflowStep step = entry.getValue().getStep();
+                String activityName = buildSfnActivityName(workflow.getClass(), step.getClass());
                 if (activitiesByName.containsKey(activityName)) {
                     String message = "Workflow " + workflowName + " has two steps with the same name: "
-                            + entry.getValue().getStep().getClass().getSimpleName();
+                            + step.getClass().getSimpleName();
                     log.error(message);
                     throw new FluxException(message);
                 }
-                activitiesByName.put(activityName, entry.getValue().getStep());
+                activitiesByName.put(activityName, step);
                 workflowsByActivityName.put(activityName, workflow);
+
+                if (step instanceof PartitionedWorkflowStep) {
+                    String generatorActivityName = activityName + SfnArnFormatter.PARTITION_GENERATOR_ACTIVITY_SUFFIX;
+                    activitiesByName.put(generatorActivityName, step);
+                    workflowsByActivityName.put(generatorActivityName, workflow);
+                }
             }
         }
     }
 
     // package-private for test access
     String buildSfnActivityName(Class<? extends Workflow> wfClass, Class<? extends WorkflowStep> stepClass) {
-        return String.format("%s-%s", wfClass.getSimpleName(), stepClass.getSimpleName());
+        return wfClass.getSimpleName() + "-" + stepClass.getSimpleName();
     }
 
     // package-private for testing
@@ -363,7 +469,105 @@ public class FluxCapacitorImpl implements FluxCapacitor {
 
     // package-private for testing
     void registerWorkflows() {
-        // TODO
+        if (workflowsByClass.isEmpty()) {
+            return;
+        }
+        if (config.getStateMachineRoleArn() == null || config.getStateMachineRoleArn().isEmpty()) {
+            throw new FluxException("stateMachineRoleArn must be set on FluxCapacitorConfig before workflows can be"
+                                    + " registered.");
+        }
+        try (MetricRecorder metrics = metricsFactory.newMetricRecorder("Flux.RegisterWorkflows")) {
+            for (Workflow workflow : workflowsByClass.values()) {
+                registerOrUpdateWorkflow(workflow, metrics);
+            }
+        }
+    }
+
+    private void registerOrUpdateWorkflow(Workflow workflow, MetricRecorder metrics) {
+        String workflowName = TaskNaming.workflowName(workflow);
+        String stateMachineArn = SfnArnFormatter.workflowArn(config.getAwsRegion(),
+                                                              config.getAwsAccountId(),
+                                                              workflow.getClass());
+
+        AslStateMachine asl = AslGenerator.generate(workflow, config.getAwsRegion(), config.getAwsAccountId());
+        String desiredDefinition = asl.toJson();
+
+        DescribeStateMachineResponse existing = describeStateMachine(stateMachineArn, metrics);
+
+        if (existing == null) {
+            log.info("Registering state machine for workflow {}", workflowName);
+            CreateStateMachineRequest createReq = CreateStateMachineRequest.builder()
+                    .name(workflowName)
+                    .definition(desiredDefinition)
+                    .roleArn(config.getStateMachineRoleArn())
+                    .type(StateMachineType.STANDARD)
+                    .publish(true)
+                    .build();
+            CreateStateMachineResponse response = AwsRetryUtils.executeWithInlineBackoff(
+                    () -> sfn.createStateMachine(createReq),
+                    REGISTRATION_MAX_RETRY_ATTEMPTS,
+                    REGISTRATION_MIN_RETRY_DELAY, REGISTRATION_MAX_RETRY_DELAY,
+                    metrics, CREATE_STATE_MACHINE_METRIC_PREFIX);
+            log.info("Created state machine for workflow {}: arn={} version={}",
+                     workflowName, response.stateMachineArn(), response.stateMachineVersionArn());
+            return;
+        }
+
+        if (definitionMatches(existing.definition(), desiredDefinition)) {
+            log.info("State machine for workflow {} is already registered with the desired definition.", workflowName);
+            return;
+        }
+
+        if (!config.isUpdateExistingStateMachines()) {
+            log.warn("State machine for workflow {} differs from Flux's generated definition, but "
+                     + "updateExistingStateMachines is false; leaving the deployed definition as-is.",
+                     workflowName);
+            return;
+        }
+
+        log.info("Updating state machine for workflow {} (definition has changed).", workflowName);
+        UpdateStateMachineRequest updateReq = UpdateStateMachineRequest.builder()
+                .stateMachineArn(stateMachineArn)
+                .definition(desiredDefinition)
+                .roleArn(config.getStateMachineRoleArn())
+                .publish(true)
+                .build();
+        AwsRetryUtils.executeWithInlineBackoff(
+                () -> sfn.updateStateMachine(updateReq),
+                REGISTRATION_MAX_RETRY_ATTEMPTS,
+                REGISTRATION_MIN_RETRY_DELAY, REGISTRATION_MAX_RETRY_DELAY,
+                metrics, UPDATE_STATE_MACHINE_METRIC_PREFIX);
+        log.info("Updated state machine for workflow {}.", workflowName);
+    }
+
+    private DescribeStateMachineResponse describeStateMachine(String stateMachineArn, MetricRecorder metrics) {
+        try {
+            DescribeStateMachineRequest request = DescribeStateMachineRequest.builder()
+                    .stateMachineArn(stateMachineArn).build();
+            return AwsRetryUtils.executeWithInlineBackoff(
+                    () -> sfn.describeStateMachine(request),
+                    REGISTRATION_MAX_RETRY_ATTEMPTS,
+                    REGISTRATION_MIN_RETRY_DELAY, REGISTRATION_MAX_RETRY_DELAY,
+                    metrics, DESCRIBE_STATE_MACHINE_METRIC_PREFIX);
+        } catch (StateMachineDoesNotExistException e) {
+            return null;
+        }
+    }
+
+    // package-private for testing
+    static boolean definitionMatches(String existingJson, String desiredJson) {
+        if (existingJson == null) {
+            return false;
+        }
+        try {
+            JsonNode existing = JSON_MAPPER.readTree(existingJson);
+            JsonNode desired = JSON_MAPPER.readTree(desiredJson);
+            return existing.equals(desired);
+        } catch (JsonProcessingException e) {
+            // If we can't parse the existing definition, treat it as a mismatch so we'll update it.
+            log.warn("Could not parse existing state machine definition; will replace it.", e);
+            return false;
+        }
     }
 
     // useless to unit-test this method, all it does is start a bunch of threads that immediately try to poll for work
@@ -380,25 +584,39 @@ public class FluxCapacitorImpl implements FluxCapacitor {
         IdentifierValidation.validateHostname(hostname);
 
         workerThreadsPerTaskList = new HashMap<>();
-        Set<String> taskLists = workflowsByClass.values().stream().map(Workflow::taskList).collect(Collectors.toSet());
-        for (String taskList : taskLists) {
+        for (Workflow workflow : workflowsByClass.values()) {
+            String taskList = workflow.taskList();
             int poolSize = config.getTaskListConfig(taskList).getActivityTaskThreadCount();
-            String poolName = String.format("worker-%s", taskList);
-            workerThreadsPerTaskList.put(taskList, new BlockOnSubmissionThreadPoolExecutor(poolSize, poolName));
+            workerThreadsPerTaskList.put(taskList, new BlockOnSubmissionThreadPoolExecutor(poolSize, "worker-" + taskList));
         }
 
         activityTaskPollerThreadsPerActivity = new HashMap<>();
-        for (Map.Entry<String, WorkflowStep> entry : activitiesByName.entrySet()) {
-            Workflow workflow = workflowsByActivityName.get(entry.getKey());
-            WorkflowStep step = entry.getValue();
-            String activityArn = SfnArnFormatter.activityArn(config.getAwsRegion(), config.getAwsAccountId(),
-                                                             workflow.getClass(), step.getClass());
-            ScheduledExecutorService service = createActivityPollerPool(entry.getKey(), hostname,
-                    config.getTaskListConfig(workflow.taskList()).getActivityPollerThreadCount(),
-                    workerName -> new ActivityTaskPoller(metricsFactory, sfn, workerName, activityArn,
-                            workflow, step, workerThreadsPerTaskList.get(workflow.taskList())));
-            activityTaskPollerThreadsPerActivity.put(entry.getKey(), service);
+        for (Workflow workflow : workflowsByClass.values()) {
+            for (WorkflowGraphNode node : workflow.getGraph().getNodes().values()) {
+                WorkflowStep step = node.getStep();
+                createPollerForStep(workflow, step, hostname, false);
+                if (step instanceof PartitionedWorkflowStep) {
+                    createPollerForStep(workflow, step, hostname, true);
+                }
+            }
         }
+    }
+
+    private void createPollerForStep(Workflow workflow, WorkflowStep step, String hostname,
+                                     boolean partitionGeneratorMode) {
+        String activityName = buildSfnActivityName(workflow.getClass(), step.getClass())
+                + (partitionGeneratorMode ? SfnArnFormatter.PARTITION_GENERATOR_ACTIVITY_SUFFIX : "");
+        String activityArn = partitionGeneratorMode
+                ? SfnArnFormatter.partitionGeneratorActivityArn(config.getAwsRegion(), config.getAwsAccountId(),
+                                                                 workflow.getClass(), step.getClass())
+                : SfnArnFormatter.activityArn(config.getAwsRegion(), config.getAwsAccountId(),
+                                               workflow.getClass(), step.getClass());
+        ScheduledExecutorService service = createActivityPollerPool(activityName, hostname,
+                config.getTaskListConfig(workflow.taskList()).getActivityPollerThreadCount(),
+                workerName -> new ActivityTaskPoller(metricsFactory, sfn, workerName, activityArn,
+                        workflow, step, workerThreadsPerTaskList.get(workflow.taskList()),
+                        partitionGeneratorMode));
+        activityTaskPollerThreadsPerActivity.put(activityName, service);
     }
 
     /**
@@ -445,7 +663,71 @@ public class FluxCapacitorImpl implements FluxCapacitor {
     }
 
     private void startPeriodicWorkflows() {
-        periodicWorkflowScheduler = Executors.newScheduledThreadPool(1);
-        // TODO
+        int poolSize = Math.max(1, (int) workflowsByClass.values().stream()
+                .filter(FluxCapacitorImpl::isPeriodicWorkflow).count());
+        periodicWorkflowScheduler = Executors.newScheduledThreadPool(poolSize,
+                ThreadUtils.createStackTraceSuppressingThreadFactory("periodicWorkflowSubmitter"));
+
+        for (Workflow workflow : workflowsByClass.values()) {
+            if (!isPeriodicWorkflow(workflow)) {
+                continue;
+            }
+
+            Periodic periodic = workflow.getClass().getAnnotation(Periodic.class);
+            long runIntervalSeconds = Math.max(1L,
+                    TimeUnit.SECONDS.convert(periodic.runInterval(), periodic.intervalUnits()));
+            long submitIntervalSeconds = computeSubmitIntervalSeconds(runIntervalSeconds);
+            String workflowName = TaskNaming.workflowName(workflow);
+
+            log.info("Scheduling periodic runs for workflow {} every {}s (run interval {}s).",
+                     workflowName, submitIntervalSeconds, runIntervalSeconds);
+
+            Runnable submitPeriodic = () -> submitPeriodicWorkflow(workflow, runIntervalSeconds);
+            periodicWorkflowScheduler.scheduleAtFixedRate(ThreadUtils.wrapInExceptionSwallower(submitPeriodic),
+                                                          0, submitIntervalSeconds, TimeUnit.SECONDS);
+        }
+    }
+
+    /** Package-private for testing. */
+    static boolean isPeriodicWorkflow(Workflow workflow) {
+        return workflow.getClass().isAnnotationPresent(Periodic.class);
+    }
+
+    /**
+     * Returns the cadence at which each worker should attempt a StartExecution for a periodic workflow.
+     * Mirrors the SWF backend: half the run interval, clamped to [5s, 1h].
+     */
+    static long computeSubmitIntervalSeconds(long runIntervalSeconds) {
+        return Math.min(Math.max(5L, runIntervalSeconds / 2L),
+                        TimeUnit.SECONDS.convert(1, TimeUnit.HOURS));
+    }
+
+    /**
+     * Constructs the deterministic SFN execution name used for a periodic-workflow submission landing in the
+     * current run-interval window. Bucketing by run-interval gives natural fleet-wide deduplication: every worker
+     * computing the name at roughly the same wall-clock moment lands on the same bucket index, and SFN's
+     * uniqueness constraint on execution names lets exactly one of them win (the rest see
+     * ExecutionAlreadyExistsException, which is treated as success).
+     *
+     * Bucket indices monotonically increase with wall-clock time, so they never collide with prior buckets
+     * within the SFN 90-day reuse window.
+     *
+     * Package-private for testing.
+     */
+    static String periodicExecutionName(String workflowName, long bucketIndex) {
+        return workflowName + "-" + bucketIndex;
+    }
+
+    private void submitPeriodicWorkflow(Workflow workflow, long runIntervalSeconds) {
+        long bucketIndex = clock.instant().getEpochSecond() / runIntervalSeconds;
+        String workflowName = TaskNaming.workflowName(workflow);
+        String executionName = periodicExecutionName(workflowName, bucketIndex);
+        try {
+            executeWorkflow(workflow.getClass(), executionName, new HashMap<>());
+        } catch (RuntimeException e) {
+            // Periodic submissions must never let a transient failure kill the scheduler thread.
+            log.warn("Failed to submit periodic workflow {} (bucket {}); will retry next interval.",
+                     workflowName, bucketIndex, e);
+        }
     }
 }

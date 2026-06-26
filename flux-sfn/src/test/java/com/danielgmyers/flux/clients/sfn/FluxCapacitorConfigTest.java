@@ -62,4 +62,18 @@ public class FluxCapacitorConfigTest {
         Assertions.assertThrows(IllegalArgumentException.class,
                 () -> config.setSfnEndpoint(null));
     }
+
+    @Test
+    public void updateExistingStateMachinesDefaultsToTrue() {
+        Assertions.assertTrue(new FluxCapacitorConfig().isUpdateExistingStateMachines());
+    }
+
+    @Test
+    public void updateExistingStateMachinesIsToggleable() {
+        FluxCapacitorConfig config = new FluxCapacitorConfig();
+        config.setUpdateExistingStateMachines(false);
+        Assertions.assertFalse(config.isUpdateExistingStateMachines());
+        config.setUpdateExistingStateMachines(true);
+        Assertions.assertTrue(config.isUpdateExistingStateMachines());
+    }
 }

@@ -31,6 +31,13 @@
             <optional>false</optional>
         </dependency>
 
+        <dependency>
+            <artifactId>sts</artifactId>
+            <groupId>software.amazon.awssdk</groupId>
+            <version>${awssdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+
         <!-- test dependencies -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>
@@ -51,6 +58,13 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <!-- Class-level parallelism is configured by src/test/resources/junit-platform.properties.
+                         Each test class registers its own disjoint set of state-machine and activity ARNs,
+                         so concurrent class execution within a single JVM does not produce poller conflicts. -->
+                    <forkCount>1</forkCount>
+                    <reuseForks>true</reuseForks>
+                </configuration>
                 <executions>
                     <execution>
                         <!-- This disables the integration tests during the standard unit test phase -->

@@ -54,7 +54,11 @@ public class ActivityTaskPoller implements Runnable {
     static final String WORKER_THREAD_AVAILABILITY_WAIT_TIME_METRIC_NAME = "Flux.WorkerThreadAvailabilityWaitTime";
     static final String NO_ACTIVITY_TASK_TO_EXECUTE_METRIC_NAME = "Flux.NoActivityTaskToExecute";
 
-    static final String RETRY_ERROR_CODE = "retry";
+    /**
+     * Error code used by the activity worker to signal a retry to Step Functions. The generated ASL
+     * has a Retry rule keyed on this code, which is how the SFN-backed Flux implements step retries.
+     */
+    public static final String RETRY_ERROR_CODE = "retry";
 
     // package-private for unit test access
     static final Duration HEARTBEAT_INTERVAL = Duration.ofSeconds(10);
@@ -69,8 +73,18 @@ public class ActivityTaskPoller implements Runnable {
     private final Workflow workflow;
     private final WorkflowStep workflowStep;
     private final String metricsSuffix;
+    private final boolean partitionGeneratorMode;
 
     private final BlockOnSubmissionThreadPoolExecutor workerThreadPool;
+
+    /**
+     * Constructs an activity poller for a regular (non-partition-generator) activity.
+     */
+    public ActivityTaskPoller(MetricRecorderFactory metricsFactory, SfnClient sfnClient, String identity,
+                              String activityArnToPoll, Workflow workflow, WorkflowStep workflowStep,
+                              BlockOnSubmissionThreadPoolExecutor workerThreadPool) {
+        this(metricsFactory, sfnClient, identity, activityArnToPoll, workflow, workflowStep, workerThreadPool, false);
+    }
 
     /**
      * Constructs an activity poller.
@@ -82,10 +96,14 @@ public class ActivityTaskPoller implements Runnable {
      * @param workflow The workflow containing the step being polled for.
      * @param workflowStep The workflow step being polled for.
      * @param workerThreadPool The pool of threads available to hand activity tasks off to.
+     * @param partitionGeneratorMode If true, invocations run the step's {@code @PartitionIdGenerator}
+     *                               method (returning the list of partition inputs) instead of
+     *                               {@code @StepApply}.
      */
     public ActivityTaskPoller(MetricRecorderFactory metricsFactory, SfnClient sfnClient, String identity,
                               String activityArnToPoll, Workflow workflow, WorkflowStep workflowStep,
-                              BlockOnSubmissionThreadPoolExecutor workerThreadPool) {
+                              BlockOnSubmissionThreadPoolExecutor workerThreadPool,
+                              boolean partitionGeneratorMode) {
         this.metricsFactory = metricsFactory;
         this.sfn = sfnClient;
 
@@ -98,35 +116,65 @@ public class ActivityTaskPoller implements Runnable {
 
         this.workflow = workflow;
         this.workflowStep = workflowStep;
-        this.metricsSuffix = workflow.getClass().getSimpleName() + "." + workflowStep.getClass().getSimpleName();
+        this.metricsSuffix = workflow.getClass().getSimpleName() + "." + workflowStep.getClass().getSimpleName()
+                + (partitionGeneratorMode ? ".Generator" : "");
+        this.partitionGeneratorMode = partitionGeneratorMode;
 
         this.workerThreadPool = workerThreadPool;
     }
 
     @Override
     public void run() {
-        // Not using try-with-resources because the metrics context needs to get closed after the poller thread
-        // gets executed, rather than when this method returns.
+        // Each Flux activity registers its own SFN activity ARN, and SFN's GetActivityTask is per-ARN.
+        // That means we have one poller (or several) per activity ARN, which is many more pollers than the
+        // SWF backend has. If we held a worker-pool permit during the long-poll, we'd quickly run out of
+        // permits and starve some activities of polling coverage — work would land in SFN's queue and sit
+        // there for up to the full 60-second long-poll timeout because no poller for that ARN was
+        // currently mid-poll.
+        //
+        // To avoid that, the poll itself is run *without* a worker permit. Only after a task arrives do we
+        // hand it off to the worker pool, blocking on the pool's submission semaphore at that point. This
+        // keeps every activity ARN continuously covered by an in-flight long-poll regardless of how many
+        // workers are currently busy.
+        //
+        // The poll-time metric recorder's lifetime now spans the poll + worker handoff. It's closed by the
+        // dispatched runnable after it picks up off the worker pool's queue, so that the worker-thread
+        // availability wait-time metric is captured against the same recorder.
         MetricRecorder metrics = metricsFactory.newMetricRecorder(this.getClass().getSimpleName());
+        GetActivityTaskResponse task;
         try {
-            metrics.startDuration(WORKER_THREAD_AVAILABILITY_WAIT_TIME_METRIC_NAME);
-            workerThreadPool.executeWhenCapacityAvailable(() -> pollForActivityTask(metrics));
-        } catch (RejectedExecutionException e) {
-            // the activity task will time out in this case, so another host will get assigned to it.
-            log.warn("The activity thread pool rejected the task. This is usually because it is shutting down.", e);
+            task = pollForActivityTask(metrics);
         } catch (Throwable t) {
-            log.debug("Got exception while polling for or executing activity task", t);
+            metrics.close();
+            log.debug("Got exception while polling for activity task", t);
             throw t;
+        }
+        if (task == null) {
+            metrics.close();
+            return;
+        }
+
+        // Block on worker-pool capacity here, not before the poll. The wait-time metric measures only this
+        // window (task in hand, waiting for a worker thread); on a non-saturated host it should be near-zero.
+        metrics.startDuration(WORKER_THREAD_AVAILABILITY_WAIT_TIME_METRIC_NAME);
+        try {
+            workerThreadPool.execute(() -> {
+                try (metrics) {
+                    Duration waitTime = metrics.endDuration(WORKER_THREAD_AVAILABILITY_WAIT_TIME_METRIC_NAME);
+                    metrics.addDuration(formatWorkerThreadAvailabilityWaitTimeMetricName(metricsSuffix),
+                                         waitTime);
+                    executeWithHeartbeat(task);
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            // Pool shutting down. The task will time out on the SFN side and be redelivered.
+            metrics.close();
+            log.warn("The activity thread pool rejected the task. This is usually because it is shutting down.", e);
         }
     }
 
-    private Runnable pollForActivityTask(MetricRecorder metrics) {
-        // Using try-with-resources here to make sure the metrics context gets closed when the poller thread is done
-        try (metrics) {
-            Duration waitTime = metrics.endDuration(WORKER_THREAD_AVAILABILITY_WAIT_TIME_METRIC_NAME);
-            // Emit the wait time metric again, for this specific activity
-            metrics.addDuration(formatWorkerThreadAvailabilityWaitTimeMetricName(metricsSuffix), waitTime);
-
+    private GetActivityTaskResponse pollForActivityTask(MetricRecorder metrics) {
+        try {
             GetActivityTaskRequest request = GetActivityTaskRequest.builder()
                     .activityArn(activityArnToPoll).workerName(identity).build();
 
@@ -135,15 +183,13 @@ public class ActivityTaskPoller implements Runnable {
                     20, Duration.ofSeconds(2), metrics, formatActivityTaskPollTimeMetricName(metricsSuffix));
 
             if (task == null || task.taskToken() == null || task.taskToken().isEmpty()) {
-                // This means there was no work to do.
-                // We'll emit a top-level "no task to execute" count, and one for this specific activity.
                 metrics.addCount(NO_ACTIVITY_TASK_TO_EXECUTE_METRIC_NAME, 1.0);
                 metrics.addCount(formatNoActivityTaskToExecuteMetricName(metricsSuffix), 1.0);
                 return null;
             }
 
             log.debug("Polled for activity task and there was work to do.");
-            return () -> executeWithHeartbeat(task);
+            return task;
         } catch (Throwable e) {
             log.warn("Got an unexpected exception when polling for an activity task.", e);
             throw e;
@@ -160,7 +206,8 @@ public class ActivityTaskPoller implements Runnable {
             SfnStepInputAccessor stepInput = new SfnStepInputAccessor(task.input());
             String workflowId = stepInput.getAttribute(String.class, StepAttributes.WORKFLOW_ID);
 
-            ActivityExecutor executor = new ActivityExecutor(identity, stepInput, workflow, workflowStep, metrics, metricsFactory);
+            ActivityExecutor executor = new ActivityExecutor(identity, stepInput, workflow, workflowStep,
+                                                              metrics, metricsFactory, partitionGeneratorMode);
 
             Thread activityThread = new Thread(executor);
             activityThread.start();

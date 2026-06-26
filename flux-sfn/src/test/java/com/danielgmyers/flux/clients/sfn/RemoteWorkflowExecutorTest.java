@@ -29,6 +29,7 @@ import com.danielgmyers.flux.testutil.ManualClock;
 import com.danielgmyers.flux.wf.Workflow;
 import com.danielgmyers.flux.wf.graph.WorkflowGraph;
 import com.danielgmyers.metrics.recorders.NoopMetricRecorderFactory;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import org.easymock.EasyMock;
 import org.easymock.IMocksControl;
 import org.junit.jupiter.api.Assertions;
@@ -181,9 +182,13 @@ public class RemoteWorkflowExecutorTest {
 
     private void expectStartWorkflowRequest(Workflow workflow, String expectedAccountId, String workflowId,
                                             Map<String, Object> input, Exception exceptionToThrow) {
-        StartExecutionRequest start
-                = FluxCapacitorImpl.buildStartWorkflowRequest(workflow, config.getAwsRegion(), expectedAccountId,
-                                                              workflowId, input);
+        StartExecutionRequest start;
+        try {
+            start = FluxCapacitorImpl.buildStartWorkflowRequest(workflow, config.getAwsRegion(), expectedAccountId,
+                                                                workflowId, input, clock);
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException(e);
+        }
         if (exceptionToThrow == null) {
             String executionArn = SfnArnFormatter.executionArn(config.getAwsRegion(), expectedAccountId, workflow.getClass(), "run-id");
             StartExecutionResponse workflowRun = StartExecutionResponse.builder().executionArn(executionArn).build();

@@ -45,11 +45,6 @@ public class SfnStepInputAccessor implements StepInputAccessor {
 
     private final ObjectNode attributes;
 
-    // package-private for unit test access
-    ObjectNode getAttributesNode() {
-        return attributes;
-    }
-
     public SfnStepInputAccessor(String rawInput) throws JsonProcessingException {
         if (rawInput == null || rawInput.isEmpty()) {
             attributes = MAPPER.createObjectNode();

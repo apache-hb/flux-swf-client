@@ -16,7 +16,6 @@
 
 package com.danielgmyers.flux.clients.sfn;
 
-import com.danielgmyers.flux.FluxCapacitor;
 import com.danielgmyers.metrics.MetricRecorderFactory;
 
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
@@ -35,8 +34,8 @@ public final class FluxCapacitorFactory {
      * @param credentials    - A provider for the AWS credentials that should be used to call AWS APIs
      * @param config         - A FluxCapacitorConfig object containing the relevant configuration information for Flux
      */
-    public static FluxCapacitor create(MetricRecorderFactory metricsFactory, AwsCredentialsProvider credentials,
-                                       FluxCapacitorConfig config) {
+    public static SfnFluxCapacitor create(MetricRecorderFactory metricsFactory, AwsCredentialsProvider credentials,
+                                          FluxCapacitorConfig config) {
         return FluxCapacitorImpl.create(metricsFactory, credentials, config);
     }
 }

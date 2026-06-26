@@ -47,13 +47,13 @@ public class SfnStepInputAccessorTest {
     @Test
     public void testNullOrEmptyInputOrEmptyMap() throws JsonProcessingException {
         SfnStepInputAccessor accessor = new SfnStepInputAccessor(null);
-        Assertions.assertTrue(accessor.getAttributesNode().isEmpty());
+        Assertions.assertEquals("{}", accessor.toJson());
 
         accessor = new SfnStepInputAccessor("");
-        Assertions.assertTrue(accessor.getAttributesNode().isEmpty());
+        Assertions.assertEquals("{}", accessor.toJson());
 
         accessor = new SfnStepInputAccessor("{}");
-        Assertions.assertTrue(accessor.getAttributesNode().isEmpty());
+        Assertions.assertEquals("{}", accessor.toJson());
     }
 
     @Test

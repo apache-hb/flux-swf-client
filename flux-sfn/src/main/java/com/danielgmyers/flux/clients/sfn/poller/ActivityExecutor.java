@@ -18,18 +18,25 @@ package com.danielgmyers.flux.clients.sfn.poller;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.util.Map;
 
 import com.danielgmyers.flux.clients.sfn.step.SfnStepInputAccessor;
 import com.danielgmyers.flux.ex.FluxException;
 import com.danielgmyers.flux.poller.TaskNaming;
+import com.danielgmyers.flux.step.PartitionIdGeneratorResult;
+import com.danielgmyers.flux.step.PartitionedWorkflowStep;
 import com.danielgmyers.flux.step.StepAttributes;
 import com.danielgmyers.flux.step.StepResult;
 import com.danielgmyers.flux.step.WorkflowStep;
 import com.danielgmyers.flux.step.internal.ActivityExecutionUtil;
+import com.danielgmyers.flux.step.internal.WorkflowStepUtil;
 import com.danielgmyers.flux.wf.Workflow;
 import com.danielgmyers.metrics.MetricRecorder;
 import com.danielgmyers.metrics.MetricRecorderFactory;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -44,12 +51,15 @@ public class ActivityExecutor implements Runnable {
     static final String WORKFLOW_ID_METRIC_NAME = "WorkflowId";
     static final String WORKFLOW_RUN_ID_METRIC_NAME = "RunId";
 
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
     private final String identity;
     private final SfnStepInputAccessor stepInput;
     private final Workflow workflow;
     private final WorkflowStep step;
     private final MetricRecorder fluxMetrics;
     private final MetricRecorderFactory metricsFactory;
+    private final boolean partitionGeneratorMode;
 
     private StepResult result;
     private String output;
@@ -58,12 +68,19 @@ public class ActivityExecutor implements Runnable {
     // package-private, only ActivityTaskPoller should be creating these
     ActivityExecutor(String identity, SfnStepInputAccessor stepInput, Workflow workflow, WorkflowStep step,
                      MetricRecorder fluxMetrics, MetricRecorderFactory metricsFactory) {
+        this(identity, stepInput, workflow, step, fluxMetrics, metricsFactory, false);
+    }
+
+    ActivityExecutor(String identity, SfnStepInputAccessor stepInput, Workflow workflow, WorkflowStep step,
+                     MetricRecorder fluxMetrics, MetricRecorderFactory metricsFactory,
+                     boolean partitionGeneratorMode) {
         this.identity = identity;
         this.stepInput = stepInput;
         this.workflow = workflow;
         this.step = step;
         this.fluxMetrics = fluxMetrics;
         this.metricsFactory = metricsFactory;
+        this.partitionGeneratorMode = partitionGeneratorMode;
         this.result = null;
         this.output = null;
         this.retryCause = null;
@@ -84,7 +101,8 @@ public class ActivityExecutor implements Runnable {
     @Override
     public void run() {
         String activityName = TaskNaming.activityName(workflow, step);
-        log.debug("Worker {} received activity task for activity {}.", identity, TaskNaming.activityName(workflow, step));
+        log.debug("Worker {} received activity task for activity {} (generatorMode={}).",
+                  identity, activityName, partitionGeneratorMode);
 
         try (MetricRecorder stepMetrics = metricsFactory.newMetricRecorder(activityName)) {
             // In practice these two fields aren't meaningfully different for Step Functions, but we'll provide them both
@@ -93,28 +111,10 @@ public class ActivityExecutor implements Runnable {
             stepMetrics.addProperty(WORKFLOW_RUN_ID_METRIC_NAME,
                                     stepInput.getAttribute(String.class, StepAttributes.WORKFLOW_EXECUTION_ID));
 
-            result = ActivityExecutionUtil.executeHooksAndActivity(workflow, step, stepInput, fluxMetrics, stepMetrics);
-
-            if (result.getAction() == StepResult.ResultAction.RETRY) {
-                // If the retry was caused by an exception, record the stack trace of the exception in the output.
-                // Otherwise, record the user-provided message, if any.
-                if (result.getCause() != null) {
-                    StringWriter sw = new StringWriter();
-                    result.getCause().printStackTrace(new PrintWriter(sw));
-                    retryCause = sw.toString();
-                } else if (result.getMessage() != null && !result.getMessage().isEmpty()) {
-                    retryCause = result.getMessage();
-                }
+            if (partitionGeneratorMode) {
+                runPartitionGenerator(stepMetrics);
             } else {
-                stepInput.addAttributes(result.getAttributes());
-                stepInput.addAttribute(StepAttributes.RESULT_CODE, result.getResultCode());
-                if (result.getMessage() != null && !result.getMessage().isEmpty()) {
-                    stepInput.addAttribute(StepAttributes.ACTIVITY_COMPLETION_MESSAGE, result.getMessage());
-                }
-
-                // Step Functions doesn't have a way to auto-merge the output data with the input data,
-                // so we need to include both input and output attributes in the output field here.
-                output = stepInput.toJson();
+                runStepApply(stepMetrics);
             }
         } catch (JsonProcessingException e) {
             // we've suppressed java.lang.Thread's default behavior (print to stdout), so we want the error logged.
@@ -126,5 +126,81 @@ public class ActivityExecutor implements Runnable {
             log.error("Caught an exception while executing activity task", e);
             throw e;
         }
+    }
+
+    private void runStepApply(MetricRecorder stepMetrics) throws JsonProcessingException {
+        result = ActivityExecutionUtil.executeHooksAndActivity(workflow, step, stepInput, fluxMetrics, stepMetrics);
+
+        if (result.getAction() == StepResult.ResultAction.RETRY) {
+            // If the retry was caused by an exception, record the stack trace of the exception in the output.
+            // Otherwise, record the user-provided message, if any.
+            if (result.getCause() != null) {
+                StringWriter sw = new StringWriter();
+                result.getCause().printStackTrace(new PrintWriter(sw));
+                retryCause = sw.toString();
+            } else if (result.getMessage() != null && !result.getMessage().isEmpty()) {
+                retryCause = result.getMessage();
+            }
+        } else {
+            stepInput.addAttributes(result.getAttributes());
+            stepInput.addAttribute(StepAttributes.RESULT_CODE, result.getResultCode());
+            if (result.getMessage() != null && !result.getMessage().isEmpty()) {
+                stepInput.addAttribute(StepAttributes.ACTIVITY_COMPLETION_MESSAGE, result.getMessage());
+            }
+
+            // Step Functions doesn't have a way to auto-merge the output data with the input data,
+            // so we need to include both input and output attributes in the output field here.
+            output = stepInput.toJson();
+        }
+    }
+
+    /**
+     * Generator-mode invocation: call the step's {@code @PartitionIdGenerator} method and return the list
+     * of partition IDs (plus any extra attributes the generator wants to publish to downstream states).
+     * The ASL Map state owns building the per-iteration input via its JSONata {@code ItemSelector}, so all
+     * this side needs to do is hand back the partition IDs and any extra attributes.
+     */
+    private void runPartitionGenerator(MetricRecorder stepMetrics) throws JsonProcessingException {
+        if (!(step instanceof PartitionedWorkflowStep)) {
+            throw new FluxException("Generator-mode invocation received for a non-partitioned step: "
+                                    + step.getClass().getSimpleName());
+        }
+        PartitionedWorkflowStep partitionedStep = (PartitionedWorkflowStep) step;
+
+        String workflowName = workflow.getClass().getSimpleName();
+        String workflowId = stepInput.getAttribute(String.class, StepAttributes.WORKFLOW_ID);
+
+        PartitionIdGeneratorResult generatorResult;
+        try {
+            generatorResult = WorkflowStepUtil.getPartitionIdsForPartitionedStep(partitionedStep, stepInput,
+                                                                                  workflowName, workflowId,
+                                                                                  metricsFactory, workflow);
+        } catch (RuntimeException e) {
+            // Treat as a retry — the worker layer reports this back to Step Functions which then honors
+            // the ASL Retry rule on the generator Task.
+            log.warn("Partition-id generator threw an exception; reporting as retry.", e);
+            StringWriter sw = new StringWriter();
+            e.printStackTrace(new PrintWriter(sw));
+            retryCause = sw.toString();
+            result = StepResult.retry(e);
+            return;
+        }
+
+        // Build {"partition_ids":[...], <user_attr>: <value>, ...} as the generator output. Additional
+        // attributes from the generator are merged directly into the top-level object; the ASL Output
+        // expression then merges the whole thing back into the Map state's input. "partition_ids" is
+        // reserved by Flux for the iteration list, so a user attribute of that name is overwritten.
+        SfnStepInputAccessor outputAccessor = new SfnStepInputAccessor(null);
+        if (generatorResult.getAdditionalAttributes() != null) {
+            outputAccessor.addAttributes(generatorResult.getAdditionalAttributes());
+        }
+        ObjectNode root = (ObjectNode) MAPPER.readTree(outputAccessor.toJson());
+        ArrayNode ids = root.putArray("partition_ids");
+        for (String partitionId : generatorResult.getPartitionIds()) {
+            ids.add(partitionId);
+        }
+
+        result = StepResult.success();
+        output = MAPPER.writeValueAsString(root);
     }
 }

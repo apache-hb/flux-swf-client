@@ -19,6 +19,7 @@ package com.danielgmyers.flux.clients.sfn;
 import java.util.regex.Pattern;
 
 import com.danielgmyers.flux.poller.TaskNaming;
+import com.danielgmyers.flux.step.PartitionedWorkflowStep;
 import com.danielgmyers.flux.step.WorkflowStep;
 import com.danielgmyers.flux.wf.Workflow;
 
@@ -76,6 +77,13 @@ public final class IdentifierValidation {
 
     static final int MAX_WORKFLOW_CLASS_NAME_LENGTH = 39;
     static final int MAX_WORKFLOW_STEP_CLASS_NAME_LENGTH = 39;
+    /**
+     * Partitioned-step class names must leave room for the generator-activity suffix
+     * ({@link com.danielgmyers.flux.clients.sfn.util.SfnArnFormatter#PARTITION_GENERATOR_ACTIVITY_SUFFIX})
+     * plus the workflow name and dash, all of which still need to fit within Step Functions' 80-character
+     * activity-name limit.
+     */
+    static final int MAX_PARTITIONED_STEP_CLASS_NAME_LENGTH = 35;
     static final int MAX_HOSTNAME_LENGTH = 77;
     static final int MAX_WORKFLOW_EXECUTION_ID_LENGTH = 80;
     static final int MAX_PARTITION_ID_LENGTH = 256;
@@ -90,7 +98,10 @@ public final class IdentifierValidation {
     }
 
     public static void validateStepName(Class<? extends WorkflowStep> clazz) {
-        validate("WorkflowStep class names", TaskNaming.stepName(clazz), MAX_WORKFLOW_STEP_CLASS_NAME_LENGTH, true);
+        boolean partitioned = PartitionedWorkflowStep.class.isAssignableFrom(clazz);
+        int maxLen = partitioned ? MAX_PARTITIONED_STEP_CLASS_NAME_LENGTH : MAX_WORKFLOW_STEP_CLASS_NAME_LENGTH;
+        String description = partitioned ? "PartitionedWorkflowStep class names" : "WorkflowStep class names";
+        validate(description, TaskNaming.stepName(clazz), maxLen, true);
     }
 
     public static void validateHostname(String hostname) {

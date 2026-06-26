@@ -27,6 +27,7 @@ import com.danielgmyers.flux.clients.sfn.util.SfnArnFormatter;
 import com.danielgmyers.flux.ex.WorkflowExecutionException;
 import com.danielgmyers.flux.wf.Workflow;
 import com.danielgmyers.metrics.MetricRecorderFactory;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -85,8 +86,14 @@ public class RemoteWorkflowExecutorImpl implements RemoteWorkflowExecutor {
         }
 
         Workflow workflow = workflowsByClass.get(workflowType);
-        StartExecutionRequest request = FluxCapacitorImpl.buildStartWorkflowRequest(workflow, config.getAwsRegion(),
-                                                                                    accountId, workflowId, workflowInput);
+        StartExecutionRequest request;
+        try {
+            request = FluxCapacitorImpl.buildStartWorkflowRequest(workflow, config.getAwsRegion(),
+                                                                  accountId, workflowId, workflowInput, clock);
+        } catch (JsonProcessingException e) {
+            throw new WorkflowExecutionException("Unable to serialize workflow input as JSON for remote workflow "
+                                                 + workflowName + " with id " + workflowId, e);
+        }
 
         log.debug("Requesting new remote workflow execution for workflow {} with id {}", workflowName, workflowId);
 

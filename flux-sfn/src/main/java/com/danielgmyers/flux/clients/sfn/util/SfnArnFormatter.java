@@ -21,6 +21,13 @@ import com.danielgmyers.flux.wf.Workflow;
 
 public final class SfnArnFormatter {
 
+    /**
+     * Suffix appended to the activity name of a partitioned step's partition-id generator activity.
+     * The generator activity is a separate SFN activity that runs the {@code @PartitionIdGenerator}
+     * method and returns the list of partition IDs for the partitioned step to iterate over.
+     */
+    public static final String PARTITION_GENERATOR_ACTIVITY_SUFFIX = "_gen";
+
     private SfnArnFormatter() {}
 
     // We don't use the SDK's Arn class to generate these because it only works for generating ARNs that have a qualifier,
@@ -42,6 +49,17 @@ public final class SfnArnFormatter {
     public static String activityArn(String region, String accountId, Class<? extends Workflow> workflowClass,
                                      Class<? extends WorkflowStep> stepClass) {
         String resourceId = String.format("%s-%s", workflowClass.getSimpleName(), stepClass.getSimpleName());
+        return sfnArn(region, accountId, "activity", resourceId);
+    }
+
+    /**
+     * Returns the ARN of the partition-id generator activity for a partitioned step.
+     */
+    public static String partitionGeneratorActivityArn(String region, String accountId,
+                                                       Class<? extends Workflow> workflowClass,
+                                                       Class<? extends WorkflowStep> stepClass) {
+        String resourceId = String.format("%s-%s%s", workflowClass.getSimpleName(), stepClass.getSimpleName(),
+                                          PARTITION_GENERATOR_ACTIVITY_SUFFIX);
         return sfnArn(region, accountId, "activity", resourceId);
     }
 }
